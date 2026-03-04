@@ -1,0 +1,971 @@
+import { useState, useEffect, useCallback } from "react";
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+
+const STAGES = ["À contacter", "Message envoyé", "Relance envoyée", "Répondu", "Call planifié", "Done"];
+const SECTORS = ["Private Debt", "Leveraged Finance", "Infrastructure Debt", "Restructuring", "DCM"];
+const GRADES = ["Analyst", "Associate", "VP", "Director", "MD"];
+
+const TARGET_COMPANIES = {
+  "Private Debt": ["Arcmont Asset Management", "Hayfin Capital", "ICG", "Pemberton Capital", "Kartesia", "Ares Management", "Apollo Credit", "HPS Investment Partners", "KKR Credit", "Blackstone Credit", "MV Credit", "Tikehau Capital"],
+  "Leveraged Finance": ["Houlihan Lokey", "Rothschild & Co", "PJT Partners", "Goldman Sachs", "JP Morgan", "Barclays", "Deutsche Bank", "BNP Paribas CIB", "Bank of America", "Natixis", "ING"],
+  "Infrastructure Debt": ["Macquarie Asset Management", "AXA IM Alts", "Infranity", "Schroders Capital", "Brookfield Asset Management"],
+  "Restructuring": ["Houlihan Lokey", "PJT Partners", "Lazard", "Alvarez & Marsal", "FTI Consulting"],
+  "DCM": ["Goldman Sachs", "JP Morgan", "Barclays", "Deutsche Bank", "BNP Paribas CIB", "Societe Generale"],
+};
+
+const BAPTISTE_BIO = `Baptiste Mulder, French-Dutch, CFA charterholder (all 3 levels first attempt), Master in Management IESEG (FT Top 26 MiM). Starting LBS MFA September 2026. Previously: BNP Paribas CIB Lisbon (Corporate Coverage EMEA), then Analyst at Magellan Asset Finance Paris (promoted after 6-month internship) — structured finance & project finance deals: vessel financing €90m, infrastructure €40m. Targeting Private Debt / Direct Lending or Leveraged Finance roles in London.`;
+
+const STORAGE_KEY = "crm:contacts:v2";
+const FOLLOWUP_DAYS = 7;
+
+const SAMPLE_CONTACTS = [
+  { id: 1, name: "Sarah Chen", company: "Arcmont Asset Management", role: "Associate - Direct Lending", grade: "Associate", school: "LBS MFA 2021", linkedin: "linkedin.com/in/sarahchen", email: "s.chen@arcmont.com", sector: "Private Debt", stage: "À contacter", notes: "", lastContact: null, followUpDate: null, source: "manual", messageHistory: [] },
+  { id: 2, name: "James O'Brien", company: "Hayfin Capital", role: "Analyst - Private Credit", grade: "Analyst", school: "LBS MFA 2023", linkedin: "linkedin.com/in/jamesobrien", email: "", sector: "Private Debt", stage: "Message envoyé", notes: "", lastContact: "2026-02-20", followUpDate: "2026-02-27", source: "manual", messageHistory: [] },
+  { id: 3, name: "Marie Dubois", company: "Houlihan Lokey", role: "Analyst - Leveraged Finance", grade: "Analyst", school: "LBS MFA 2022", linkedin: "linkedin.com/in/mariedubois", email: "m.dubois@hl.com", sector: "Leveraged Finance", stage: "Répondu", notes: "Very friendly, proposed a call next week", lastContact: "2026-02-25", followUpDate: null, source: "apollo", messageHistory: [] },
+];
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+const today = () => new Date().toISOString().split("T")[0];
+const addDays = (d, n) => new Date(new Date(d).getTime() + n * 86400000).toISOString().split("T")[0];
+const isPast = (d) => d && new Date(d) <= new Date();
+
+const stageStyle = (stage) => ({
+  "À contacter":    { bg: "#F1F5F9", color: "#64748B", dot: "#94A3B8" },
+  "Message envoyé": { bg: "#EFF6FF", color: "#3B82F6", dot: "#3B82F6" },
+  "Relance envoyée":{ bg: "#FFFBEB", color: "#D97706", dot: "#F59E0B" },
+  "Répondu":        { bg: "#F0FDF4", color: "#16A34A", dot: "#22C55E" },
+  "Call planifié":  { bg: "#F5F3FF", color: "#7C3AED", dot: "#8B5CF6" },
+  "Done":           { bg: "#ECFDF5", color: "#065F46", dot: "#10B981" },
+}[stage] || { bg: "#F1F5F9", color: "#64748B", dot: "#94A3B8" });
+
+const exportCSV = (contacts) => {
+  const headers = ["Name","Company","Role","Grade","Sector","School","Email","LinkedIn","Stage","Last Contact","Follow-up Date","Notes","Source"];
+  const rows = contacts.map(c => [
+    c.name, c.company, c.role, c.grade, c.sector, c.school,
+    c.email, c.linkedin, c.stage, c.lastContact || "", c.followUpDate || "", 
+    `"${(c.notes || "").replace(/"/g, '""')}"`, c.source
+  ]);
+  const csv = [headers, ...rows].map(r => r.join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = "networking_crm.csv"; a.click();
+};
+
+// ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
+
+export default function NetworkingCRM() {
+  const [contacts, setContacts] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [activeTab, setActiveTab] = useState("pipeline");
+  const [selectedContact, setSelectedContact] = useState(null);
+  const [showAddContact, setShowAddContact] = useState(false);
+  const [showApollo, setShowApollo] = useState(false);
+  const [filterSector, setFilterSector] = useState("Tous");
+  const [filterStage, setFilterStage] = useState("Tous");
+  const [filterGrade, setFilterGrade] = useState("Tous");
+  const [newContact, setNewContact] = useState({ name: "", company: "", role: "", grade: "Analyst", school: "", linkedin: "", email: "", sector: "Private Debt", notes: "" });
+
+  // Message generation
+  const [generatingMsg, setGeneratingMsg] = useState(false);
+  const [analyzingProfile, setAnalyzingProfile] = useState(false);
+  const [profileAnalysis, setProfileAnalysis] = useState(null);
+  const [generatedMessage, setGeneratedMessage] = useState("");
+  const [msgType, setMsgType] = useState("linkedin");
+  const [gmailStatus, setGmailStatus] = useState("");
+
+  // Apollo
+  const [apolloKey, setApolloKey] = useState("");
+  const [apolloSearching, setApolloSearching] = useState(false);
+  const [apolloResults, setApolloResults] = useState([]);
+  const [apolloError, setApolloError] = useState("");
+  const [apolloSector, setApolloSector] = useState("Private Debt");
+  const [apolloCompany, setApolloCompany] = useState("");
+  const [apolloCustomCompany, setApolloCustomCompany] = useState("");
+  const [apolloImported, setApolloImported] = useState(0);
+  const [showApiKey, setShowApiKey] = useState(false);
+
+  // Calendar
+  const [showCalendar, setShowCalendar] = useState(false);
+  const [calendarContact, setCalendarContact] = useState(null);
+  const [calEvent, setCalEvent] = useState({ date: "", time: "10:00", platform: "Google Meet" });
+  const [calendarStatus, setCalendarStatus] = useState("");
+
+  // ── Storage: load ──
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = JSON.parse(localStorage.getItem(STORAGE_KEY));
+        setContacts(res || SAMPLE_CONTACTS);
+      } catch {
+        setContacts(SAMPLE_CONTACTS);
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  // ── Storage: save on change ──
+  useEffect(() => {
+    if (!loaded) return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(contacts));
+  }, [contacts, loaded]);
+
+  // ── Derived ──
+  const filteredContacts = contacts.filter(c => {
+    if (filterSector !== "Tous" && c.sector !== filterSector) return false;
+    if (filterStage !== "Tous" && c.stage !== filterStage) return false;
+    if (filterGrade !== "Tous" && c.grade !== filterGrade) return false;
+    return true;
+  });
+
+  const dueFollowUps = contacts.filter(c =>
+    (c.stage === "Message envoyé" || c.stage === "Relance envoyée") && isPast(c.followUpDate)
+  );
+
+  const stageCount = (s) => contacts.filter(c => c.stage === s).length;
+
+  // ── Analytics ──
+  const analytics = {
+    total: contacts.length,
+    replied: contacts.filter(c => ["Répondu","Call planifié","Done"].includes(c.stage)).length,
+    calls: contacts.filter(c => ["Call planifié","Done"].includes(c.stage)).length,
+    done: contacts.filter(c => c.stage === "Done").length,
+    replyRate: contacts.length ? Math.round(contacts.filter(c => ["Répondu","Call planifié","Done"].includes(c.stage)).length / contacts.filter(c => c.stage !== "À contacter").length * 100) || 0 : 0,
+    bySector: SECTORS.map(s => ({
+      sector: s,
+      total: contacts.filter(c => c.sector === s).length,
+      replied: contacts.filter(c => c.sector === s && ["Répondu","Call planifié","Done"].includes(c.stage)).length,
+    })),
+  };
+
+  // ── Mutations ──
+  const updateContact = useCallback((id, patch) => {
+    setContacts(prev => prev.map(c => c.id === id ? { ...c, ...patch } : c));
+    setSelectedContact(prev => prev?.id === id ? { ...prev, ...patch } : prev);
+  }, []);
+
+  const updateContactStage = useCallback((id, stage) => {
+    const patch = {
+      stage,
+      lastContact: today(),
+      followUpDate: (stage === "Message envoyé" || stage === "Relance envoyée") ? addDays(today(), FOLLOWUP_DAYS) : undefined,
+    };
+    if (patch.followUpDate === undefined) delete patch.followUpDate;
+    updateContact(id, patch);
+    if (stage === "Call planifié") {
+      const c = contacts.find(x => x.id === id);
+      setCalendarContact(c);
+      setShowCalendar(true);
+    }
+  }, [contacts, updateContact]);
+
+  const addContact = () => {
+    if (!newContact.name || !newContact.company) return;
+    const c = { ...newContact, id: Date.now(), lastContact: null, followUpDate: null, source: "manual", messageHistory: [] };
+    setContacts(prev => [...prev, c]);
+    setNewContact({ name: "", company: "", role: "", grade: "Analyst", school: "", linkedin: "", email: "", sector: "Private Debt", notes: "" });
+    setShowAddContact(false);
+    setSelectedContact(c);
+    setActiveTab("contacts");
+  };
+
+  // ── Profile Analysis ──
+  const analyzeProfile = async (contact) => {
+    setAnalyzingProfile(true);
+    setProfileAnalysis(null);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          messages: [{
+            role: "user",
+            content: `Analyze this networking target for Baptiste Mulder and return ONLY a JSON object (no markdown, no preamble):
+Target: ${contact.name}, ${contact.role} at ${contact.company}, ${contact.school}, sector: ${contact.sector}, grade: ${contact.grade || "unknown"}.
+Notes: ${contact.notes || "none"}.
+Baptiste's profile: ${BAPTISTE_BIO}
+
+Return JSON with these exact keys:
+{
+  "hookPoints": ["2-3 specific conversation hooks based on their role/company/background"],
+  "commonGround": "1 sentence on shared LBS / finance background angle",
+  "angleRecommended": "best outreach angle in 1 sentence",
+  "toneRecommended": "formal | semi-formal | casual",
+  "estimatedResponseRate": "X%",
+  "redFlags": "any concerns or leave empty string"
+}`
+          }]
+        })
+      });
+      const data = await res.json();
+      const text = data.content?.find(b => b.type === "text")?.text || "{}";
+      const clean = text.replace(/```json|```/g, "").trim();
+      setProfileAnalysis(JSON.parse(clean));
+    } catch {
+      setProfileAnalysis({ hookPoints: ["Could not analyze — proceed manually"], commonGround: "", angleRecommended: "", toneRecommended: "semi-formal", estimatedResponseRate: "N/A", redFlags: "" });
+    }
+    setAnalyzingProfile(false);
+  };
+
+  // ── Message Generation ──
+  const generateMessage = async (contact, type, isFollowUp = false) => {
+    setGeneratingMsg(true);
+    setGeneratedMessage("");
+    setGmailStatus("");
+
+    const analysisCtx = profileAnalysis
+      ? `Profile analysis: hooks = ${profileAnalysis.hookPoints?.join(", ")}; angle = ${profileAnalysis.angleRecommended}; tone = ${profileAnalysis.toneRecommended}.`
+      : "";
+
+    const prompt = isFollowUp
+      ? `You are Baptiste Mulder. Write a short, natural follow-up message to ${contact.name}, ${contact.role} at ${contact.company} (${contact.school}). Baptiste sent a first message ${FOLLOWUP_DAYS} days ago asking for a 20-min informational coffee, no reply.
+Format: ${type === "linkedin" ? "LinkedIn in English, max 80 words, concise, not pushy" : "Email in English, start with 'Subject:' then blank line then body, max 80 words"}.
+Baptiste profile: ${BAPTISTE_BIO}
+Rules: natural, brief context reminder, renew request for 20min call.`
+      : `You are Baptiste Mulder. Write a personalized, non-generic networking message to ${contact.name}, ${contact.role} at ${contact.company} (${contact.school}), sector ${contact.sector}.
+Baptiste profile: ${BAPTISTE_BIO}
+${analysisCtx}
+Contact notes: ${contact.notes || "none"}.
+Goal: request a 20-min informational coffee or call.
+Format: ${type === "linkedin" ? "LinkedIn in English, max 200 words, conversational, no template feel" : "Email in English, start with 'Subject:' then blank line then body, max 150 words"}.
+Rules:
+- Reference LBS connection specifically
+- Mention their role at ${contact.company}
+- Briefly mention Baptiste's debt/project finance background (Magellan, BNP)
+- End with a simple ask for a 20-min call
+- Tone: professional but human, not corporate`;
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          messages: [{ role: "user", content: prompt }]
+        })
+      });
+      const data = await res.json();
+      const text = data.content?.find(b => b.type === "text")?.text || "Generation error.";
+      setGeneratedMessage(text);
+      // Save to history
+      const histEntry = { date: today(), type: isFollowUp ? "followup" : "initial", channel: type, preview: text.slice(0, 80) };
+      updateContact(contact.id, { messageHistory: [...(contact.messageHistory || []), histEntry] });
+    } catch {
+      setGeneratedMessage("API connection error.");
+    }
+    setGeneratingMsg(false);
+  };
+
+  // ── Gmail Draft ──
+  const createGmailDraft = async (contact) => {
+    if (!generatedMessage || msgType !== "email") return;
+    setGmailStatus("Creating Gmail draft...");
+    const lines = generatedMessage.split("\n");
+    const subjectLine = lines.find(l => l.toLowerCase().startsWith("subject:"));
+    const subject = subjectLine ? subjectLine.replace(/^subject:\s*/i, "").trim() : `Networking - LBS MFA - ${contact.company}`;
+    const body = lines.filter(l => !l.toLowerCase().startsWith("subject:")).join("\n").trim();
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 200,
+          messages: [{ role: "user", content: `Create a Gmail draft email to ${contact.email} with subject "${subject}" and body:\n\n${body}` }],
+          mcp_servers: [{ type: "url", url: "https://gmail.mcp.claude.com/mcp", name: "gmail" }]
+        })
+      });
+      if (res.ok) {
+        setGmailStatus("✅ Draft created in Gmail — ready to send");
+      } else {
+        setGmailStatus("⚠️ Gmail error — copy message manually");
+      }
+    } catch {
+      setGmailStatus("⚠️ Gmail error — copy message manually");
+    }
+  };
+
+  // ── Calendar Event ──
+  const createCalendarEvent = async () => {
+    if (!calEvent.date || !calendarContact) return;
+    setCalendarStatus("Creating calendar event...");
+    const dtStart = `${calEvent.date}T${calEvent.time}:00`;
+    const dtEnd = `${calEvent.date}T${String(Number(calEvent.time.split(":")[0]) + 0)}:${calEvent.time.split(":")[1]}:00`;
+    const description = `Informational call with ${calendarContact.name} (${calendarContact.role} @ ${calendarContact.company})\n\nContext: LBS MFA networking — Baptiste Mulder\nPlatform: ${calEvent.platform}`;
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 200,
+          messages: [{
+            role: "user",
+            content: `Create a Google Calendar event:
+Title: "Call - ${calendarContact.name} (${calendarContact.company}) - LBS Networking"
+Start: ${dtStart}
+Duration: 20 minutes
+Description: ${description}
+${calendarContact.email ? `Attendee: ${calendarContact.email}` : ""}
+Add a ${calEvent.platform} link.`
+          }],
+          mcp_servers: [{ type: "url", url: "https://gmail.mcp.claude.com/mcp", name: "gmail" }]
+        })
+      });
+      setCalendarStatus(res.ok ? "✅ Event created in Google Calendar" : "⚠️ Calendar error — create manually");
+    } catch {
+      setCalendarStatus("⚠️ Calendar error — create manually");
+    }
+  };
+
+  // ── One-click Follow-up ──
+  const oneClickFollowUp = async (contact) => {
+    setSelectedContact(contact);
+    setMsgType("email");
+    setProfileAnalysis(null);
+    setGeneratedMessage("");
+    setGmailStatus("");
+    await generateMessage(contact, "email", true);
+    updateContactStage(contact.id, "Relance envoyée");
+  };
+
+  // ── Apollo ──
+  const searchApollo = async () => {
+    if (!apolloKey) { setApolloError("Missing Apollo API key"); return; }
+    const company = apolloCustomCompany || apolloCompany;
+    if (!company) { setApolloError("Select or enter a target company"); return; }
+    setApolloSearching(true); setApolloResults([]); setApolloError("");
+    try {
+      const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Api-Key": apolloKey, "Cache-Control": "no-cache" },
+        body: JSON.stringify({ page: 1, per_page: 25, organization_names: [company], person_titles: ["Analyst","Associate","Vice President","Director","Manager","Senior Associate"], q_keywords: "London Business School" }),
+      });
+      if (!res.ok) throw new Error(`Apollo API error (${res.status})`);
+      const data = await res.json();
+      const people = data.people || [];
+      const lbs = people.filter(p => (p.education || []).some(e => e.school_name?.toLowerCase().includes("london business school") || e.school_name?.toLowerCase().includes("lbs")) || (p.headline || "").toLowerCase().includes("london business school"));
+      const results = lbs.length > 0 ? lbs : people.slice(0, 15);
+      if (!lbs.length && people.length) setApolloError(`⚠️ No LBS alumni detected among ${people.length} profiles — showing all. Verify manually.`);
+      else if (!people.length) setApolloError("No results. Try another company name.");
+      setApolloResults(results.map(p => {
+        const lbsEdu = (p.education || []).find(e => e.school_name?.toLowerCase().includes("london business school") || e.school_name?.toLowerCase().includes("lbs"));
+        return { apolloId: p.id, name: `${p.first_name||""} ${p.last_name||""}`.trim(), company: p.organization?.name || company, role: p.title || "", grade: p.seniority || "Analyst", email: p.email || "", linkedin: p.linkedin_url?.replace(/https?:\/\//,"") || "", school: lbsEdu ? `LBS ${lbsEdu.degree||""} ${lbsEdu.graduation_year||""}`.trim() : "To verify", sector: apolloSector, selected: false };
+      }));
+    } catch (err) { setApolloError(`Error: ${err.message}`); }
+    setApolloSearching(false);
+  };
+
+  const importFromApollo = () => {
+    const toImport = apolloResults.filter(r => r.selected);
+    if (!toImport.length) return;
+    setContacts(prev => [...prev, ...toImport.map(r => ({ id: Date.now() + Math.random(), name: r.name, company: r.company, role: r.role, grade: r.grade || "Analyst", school: r.school, linkedin: r.linkedin, email: r.email, sector: r.sector, stage: "À contacter", notes: "", lastContact: null, followUpDate: null, source: "apollo", messageHistory: [] }))]);
+    setApolloImported(toImport.length);
+    setApolloResults([]); setShowApollo(false);
+    setTimeout(() => setApolloImported(0), 4000);
+  };
+
+  if (!loaded) return (
+    <div style={{ minHeight: "100vh", background: "#0F172A", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ color: "#94A3B8", fontFamily: "monospace", fontSize: 14 }}>Loading CRM...</div>
+    </div>
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // RENDER
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#0F172A", fontFamily: "'DM Sans', system-ui, sans-serif", color: "#E2E8F0" }}>
+
+      {/* ── HEADER ── */}
+      <div style={{ background: "#0F172A", borderBottom: "1px solid #1E293B", padding: "16px 28px", position: "sticky", top: 0, zIndex: 40 }}>
+        <div style={{ maxWidth: 1300, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#3B82F6", boxShadow: "0 0 8px #3B82F6" }} />
+              <span style={{ fontSize: 17, fontWeight: 700, color: "#F1F5F9", letterSpacing: "-0.3px" }}>Networking CRM</span>
+              <span style={{ fontSize: 11, color: "#475569", background: "#1E293B", padding: "2px 8px", borderRadius: 4, fontWeight: 500 }}>v2</span>
+            </div>
+            <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>Baptiste Mulder · LBS MFA 2026 · Private Debt & LevFin London</div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            {apolloImported > 0 && <Chip color="#10B981">✓ {apolloImported} imported from Apollo</Chip>}
+            {dueFollowUps.length > 0 && <Chip color="#F59E0B" pulse>🔔 {dueFollowUps.length} follow-up{dueFollowUps.length > 1 ? "s" : ""} due</Chip>}
+            <Btn ghost onClick={() => exportCSV(filteredContacts)}>↓ CSV</Btn>
+            <Btn ghost onClick={() => { setShowApollo(true); setApolloResults([]); setApolloError(""); }}>🔍 Apollo</Btn>
+            <Btn primary onClick={() => setShowAddContact(true)}>+ Add</Btn>
+          </div>
+        </div>
+      </div>
+
+      {/* ── TABS ── */}
+      <div style={{ background: "#0F172A", borderBottom: "1px solid #1E293B", padding: "0 28px" }}>
+        <div style={{ maxWidth: 1300, margin: "0 auto", display: "flex", gap: 0 }}>
+          {[
+            { id: "pipeline", label: "Pipeline" },
+            { id: "contacts", label: `Contacts (${contacts.length})` },
+            { id: "followups", label: `Follow-ups${dueFollowUps.length > 0 ? ` · ${dueFollowUps.length}` : ""}`, alert: dueFollowUps.length > 0 },
+            { id: "analytics", label: "Analytics" },
+          ].map(tab => (
+            <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{ padding: "12px 18px", fontSize: 13, fontWeight: activeTab === tab.id ? 600 : 400, color: activeTab === tab.id ? "#F1F5F9" : "#64748B", borderBottom: activeTab === tab.id ? "2px solid #3B82F6" : "2px solid transparent", background: "none", border: "none", borderBottom: activeTab === tab.id ? "2px solid #3B82F6" : "2px solid transparent", cursor: "pointer", transition: "all .15s", position: "relative" }}>
+              {tab.label}
+              {tab.alert && <span style={{ marginLeft: 4, width: 6, height: 6, borderRadius: "50%", background: "#F59E0B", display: "inline-block", verticalAlign: "middle" }} />}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ── FILTERS ── */}
+      <div style={{ background: "#0F172A", padding: "12px 28px", borderBottom: "1px solid #1E293B" }}>
+        <div style={{ maxWidth: 1300, margin: "0 auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <Select value={filterSector} onChange={e => setFilterSector(e.target.value)} options={["Tous", ...SECTORS]} placeholder="All sectors" />
+          <Select value={filterStage} onChange={e => setFilterStage(e.target.value)} options={["Tous", ...STAGES]} placeholder="All stages" />
+          <Select value={filterGrade} onChange={e => setFilterGrade(e.target.value)} options={["Tous", ...GRADES]} placeholder="All grades" />
+          {(filterSector !== "Tous" || filterStage !== "Tous" || filterGrade !== "Tous") && (
+            <button onClick={() => { setFilterSector("Tous"); setFilterStage("Tous"); setFilterGrade("Tous"); }} style={{ fontSize: 11, color: "#64748B", background: "none", border: "none", cursor: "pointer", padding: "0 4px" }}>× Clear filters</button>
+          )}
+          <span style={{ fontSize: 11, color: "#475569", marginLeft: "auto", display: "flex", alignItems: "center" }}>{filteredContacts.length} contact{filteredContacts.length !== 1 ? "s" : ""}</span>
+        </div>
+      </div>
+
+      {/* ── MAIN CONTENT ── */}
+      <div style={{ maxWidth: 1300, margin: "0 auto", padding: "24px 28px" }}>
+
+        {/* PIPELINE */}
+        {activeTab === "pipeline" && (
+          <div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 12, marginBottom: 20 }}>
+              {STAGES.map(stage => {
+                const s = stageStyle(stage);
+                return (
+                  <div key={stage} style={{ background: "#1E293B", borderRadius: 10, padding: "14px 12px", textAlign: "center", border: "1px solid #293548" }}>
+                    <div style={{ fontSize: 10, color: "#64748B", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.5px", fontWeight: 600 }}>{stage}</div>
+                    <div style={{ fontSize: 26, fontWeight: 700, color: s.color }}>{stageCount(stage)}</div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 12 }}>
+              {STAGES.map(stage => {
+                const stageContacts = filteredContacts.filter(c => c.stage === stage);
+                return (
+                  <div key={stage} style={{ background: "#1E293B", borderRadius: 12, padding: 12, border: "1px solid #293548", minHeight: 200 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 10 }}>{stage}</div>
+                    {stageContacts.map(c => (
+                      <div key={c.id} onClick={() => { setSelectedContact(c); setGeneratedMessage(""); setProfileAnalysis(null); setGmailStatus(""); }} style={{ background: "#0F172A", borderRadius: 8, padding: 10, marginBottom: 8, cursor: "pointer", border: "1px solid #1E293B", transition: "border-color .15s" }}
+                        onMouseEnter={e => e.currentTarget.style.borderColor = "#3B82F6"}
+                        onMouseLeave={e => e.currentTarget.style.borderColor = "#1E293B"}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: "#F1F5F9", marginBottom: 2 }}>{c.name}</div>
+                        <div style={{ fontSize: 10, color: "#64748B", marginBottom: 4 }}>{c.company}</div>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                          <StagePill stage={c.stage} small />
+                          {isPast(c.followUpDate) && <span style={{ fontSize: 9, color: "#F59E0B" }}>🔔</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* CONTACTS */}
+        {activeTab === "contacts" && (
+          <div style={{ background: "#1E293B", borderRadius: 12, border: "1px solid #293548", overflow: "hidden" }}>
+            <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ background: "#0F172A" }}>
+                  {["Name","Company","Role","Grade","Sector","School","Stage","Last Contact","Source",""].map(h => (
+                    <th key={h} style={{ padding: "10px 14px", textAlign: "left", fontSize: 10, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: "0.5px", borderBottom: "1px solid #293548" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredContacts.map((c, i) => (
+                  <tr key={c.id} style={{ borderBottom: "1px solid #1E293B", background: i % 2 === 0 ? "transparent" : "#141E2E" }}>
+                    <td style={{ padding: "10px 14px", fontWeight: 600, color: "#F1F5F9" }}>{c.name}</td>
+                    <td style={{ padding: "10px 14px", color: "#94A3B8", maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.company}</td>
+                    <td style={{ padding: "10px 14px", color: "#64748B", maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.role}</td>
+                    <td style={{ padding: "10px 14px" }}><GradePill grade={c.grade} /></td>
+                    <td style={{ padding: "10px 14px" }}><span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: "#1E293B", color: "#94A3B8", border: "1px solid #293548" }}>{c.sector}</span></td>
+                    <td style={{ padding: "10px 14px", color: "#475569", fontSize: 11 }}>{c.school}</td>
+                    <td style={{ padding: "10px 14px" }}><StagePill stage={c.stage} /></td>
+                    <td style={{ padding: "10px 14px", color: "#475569", fontSize: 11 }}>{c.lastContact || "—"}</td>
+                    <td style={{ padding: "10px 14px" }}>
+                      <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: c.source === "apollo" ? "#431407" : "#0F172A", color: c.source === "apollo" ? "#FB923C" : "#475569", border: `1px solid ${c.source === "apollo" ? "#7C2D12" : "#293548"}` }}>{c.source === "apollo" ? "Apollo" : "Manual"}</span>
+                    </td>
+                    <td style={{ padding: "10px 14px" }}>
+                      <button onClick={() => { setSelectedContact(c); setGeneratedMessage(""); setProfileAnalysis(null); setGmailStatus(""); }} style={{ fontSize: 11, color: "#3B82F6", background: "none", border: "none", cursor: "pointer", fontWeight: 500 }}>Open →</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* FOLLOW-UPS */}
+        {activeTab === "followups" && (
+          <div>
+            {dueFollowUps.length === 0 ? (
+              <div style={{ background: "#1E293B", borderRadius: 12, padding: 48, textAlign: "center", color: "#475569", border: "1px solid #293548" }}>
+                <div style={{ fontSize: 32, marginBottom: 8 }}>🎉</div>
+                <div style={{ fontWeight: 600, color: "#94A3B8" }}>No follow-ups due</div>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {dueFollowUps.map(c => (
+                  <div key={c.id} style={{ background: "#1E293B", borderRadius: 12, padding: "16px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, border: "1px solid #7C2D12" }}>
+                    <div>
+                      <div style={{ fontWeight: 700, color: "#F1F5F9", fontSize: 14 }}>{c.name}</div>
+                      <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>{c.role} · {c.company}</div>
+                      <div style={{ fontSize: 11, color: "#F59E0B", marginTop: 4 }}>Due since {c.followUpDate} · {c.stage}</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <Btn small ghost onClick={() => { setSelectedContact(c); setGeneratedMessage(""); setProfileAnalysis(null); setGmailStatus(""); setActiveTab("contacts"); }}>Open profile</Btn>
+                      <Btn small warning onClick={() => oneClickFollowUp(c)}>⚡ 1-click follow-up</Btn>
+                      <Btn small success onClick={() => updateContactStage(c.id, "Répondu")}>✓ Replied</Btn>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ANALYTICS */}
+        {activeTab === "analytics" && (
+          <div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14, marginBottom: 24 }}>
+              {[
+                { label: "Total contacts", value: analytics.total, color: "#3B82F6" },
+                { label: "Replied / responded", value: analytics.replied, color: "#10B981" },
+                { label: "Calls booked", value: analytics.calls, color: "#8B5CF6" },
+                { label: "Reply rate (sent)", value: `${analytics.replyRate}%`, color: "#F59E0B" },
+              ].map(m => (
+                <div key={m.label} style={{ background: "#1E293B", borderRadius: 12, padding: "20px 22px", border: "1px solid #293548" }}>
+                  <div style={{ fontSize: 11, color: "#475569", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 8 }}>{m.label}</div>
+                  <div style={{ fontSize: 32, fontWeight: 700, color: m.color }}>{m.value}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ background: "#1E293B", borderRadius: 12, border: "1px solid #293548", overflow: "hidden" }}>
+              <div style={{ padding: "14px 20px", borderBottom: "1px solid #293548", fontSize: 13, fontWeight: 600, color: "#94A3B8" }}>By sector</div>
+              <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ background: "#0F172A" }}>
+                    {["Sector","Total","Replied","Reply rate","Pipeline bar"].map(h => (
+                      <th key={h} style={{ padding: "10px 16px", textAlign: "left", fontSize: 10, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: "0.5px" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {analytics.bySector.filter(s => s.total > 0).map(s => {
+                    const rate = s.total > 0 ? Math.round(s.replied / s.total * 100) : 0;
+                    return (
+                      <tr key={s.sector} style={{ borderTop: "1px solid #1E293B" }}>
+                        <td style={{ padding: "12px 16px", fontWeight: 600, color: "#F1F5F9" }}>{s.sector}</td>
+                        <td style={{ padding: "12px 16px", color: "#94A3B8" }}>{s.total}</td>
+                        <td style={{ padding: "12px 16px", color: "#10B981" }}>{s.replied}</td>
+                        <td style={{ padding: "12px 16px", color: "#F59E0B" }}>{rate}%</td>
+                        <td style={{ padding: "12px 16px", width: 160 }}>
+                          <div style={{ background: "#0F172A", borderRadius: 4, height: 6, overflow: "hidden" }}>
+                            <div style={{ width: `${rate}%`, height: "100%", background: "#3B82F6", borderRadius: 4, transition: "width .5s" }} />
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ marginTop: 16, background: "#1E293B", borderRadius: 12, border: "1px solid #293548", overflow: "hidden" }}>
+              <div style={{ padding: "14px 20px", borderBottom: "1px solid #293548", fontSize: 13, fontWeight: 600, color: "#94A3B8" }}>Pipeline funnel</div>
+              <div style={{ padding: "16px 20px", display: "flex", gap: 8, alignItems: "flex-end" }}>
+                {STAGES.map(stage => {
+                  const count = stageCount(stage);
+                  const maxCount = Math.max(...STAGES.map(s => stageCount(s)), 1);
+                  const s = stageStyle(stage);
+                  return (
+                    <div key={stage} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: s.color }}>{count}</div>
+                      <div style={{ width: "100%", background: s.bg, borderRadius: 4, height: Math.max(8, count / maxCount * 80), transition: "height .5s" }} />
+                      <div style={{ fontSize: 9, color: "#475569", textAlign: "center", lineHeight: 1.2 }}>{stage}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ═══════════════════ CONTACT DETAIL PANEL ═══════════════════ */}
+      {selectedContact && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 50, display: "flex", justifyContent: "flex-end" }} onClick={() => setSelectedContact(null)}>
+          <div style={{ background: "#0F172A", width: "100%", maxWidth: 520, height: "100%", overflowY: "auto", borderLeft: "1px solid #1E293B", boxShadow: "-8px 0 40px rgba(0,0,0,0.5)" }} onClick={e => e.stopPropagation()}>
+
+            {/* Header */}
+            <div style={{ padding: "24px 24px 16px", borderBottom: "1px solid #1E293B", background: "#0F172A", position: "sticky", top: 0, zIndex: 10 }}>
+              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 4 }}>
+                    <span style={{ fontSize: 18, fontWeight: 700, color: "#F1F5F9" }}>{selectedContact.name}</span>
+                    {selectedContact.source === "apollo" && <span style={{ fontSize: 10, background: "#431407", color: "#FB923C", padding: "1px 6px", borderRadius: 4, border: "1px solid #7C2D12" }}>Apollo</span>}
+                  </div>
+                  <div style={{ fontSize: 13, color: "#94A3B8" }}>{selectedContact.role}</div>
+                  <div style={{ fontSize: 14, fontWeight: 600, color: "#3B82F6", marginTop: 2 }}>{selectedContact.company}</div>
+                  <div style={{ fontSize: 11, color: "#475569", marginTop: 4 }}>{selectedContact.school} · {selectedContact.sector}</div>
+                  <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+                    {selectedContact.linkedin && <a href={`https://${selectedContact.linkedin}`} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "#3B82F6", background: "#1E293B", padding: "3px 10px", borderRadius: 6, textDecoration: "none", border: "1px solid #293548" }}>LinkedIn →</a>}
+                    {selectedContact.email && <span style={{ fontSize: 11, color: "#64748B", background: "#1E293B", padding: "3px 10px", borderRadius: 6, border: "1px solid #293548" }}>{selectedContact.email}</span>}
+                  </div>
+                </div>
+                <button onClick={() => setSelectedContact(null)} style={{ fontSize: 20, color: "#475569", background: "none", border: "none", cursor: "pointer", padding: "0 4px", flexShrink: 0 }}>×</button>
+              </div>
+            </div>
+
+            <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 20 }}>
+
+              {/* Stage */}
+              <Section label="Pipeline stage">
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {STAGES.map(s => (
+                    <button key={s} onClick={() => updateContactStage(selectedContact.id, s)} style={{ fontSize: 11, padding: "5px 12px", borderRadius: 20, border: `1.5px solid ${selectedContact.stage === s ? stageStyle(s).color : "#293548"}`, background: selectedContact.stage === s ? stageStyle(s).bg : "transparent", color: selectedContact.stage === s ? stageStyle(s).color : "#64748B", cursor: "pointer", fontWeight: selectedContact.stage === s ? 600 : 400, transition: "all .15s" }}>
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </Section>
+
+              {/* Profile Analysis */}
+              <Section label="AI profile analysis">
+                {!profileAnalysis && !analyzingProfile && (
+                  <Btn primary onClick={() => analyzeProfile(selectedContact)}>🔍 Analyze profile before messaging</Btn>
+                )}
+                {analyzingProfile && <LoadingDots label="Analyzing profile..." />}
+                {profileAnalysis && (
+                  <div style={{ background: "#1E293B", borderRadius: 10, padding: 14, fontSize: 12, display: "flex", flexDirection: "column", gap: 10, border: "1px solid #293548" }}>
+                    <div>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>Hook points</div>
+                      {(profileAnalysis.hookPoints || []).map((h, i) => (
+                        <div key={i} style={{ color: "#94A3B8", marginBottom: 3, paddingLeft: 10, borderLeft: "2px solid #3B82F6" }}>{h}</div>
+                      ))}
+                    </div>
+                    {profileAnalysis.commonGround && <InfoRow label="Common ground" value={profileAnalysis.commonGround} />}
+                    {profileAnalysis.angleRecommended && <InfoRow label="Recommended angle" value={profileAnalysis.angleRecommended} />}
+                    <div style={{ display: "flex", gap: 8 }}>
+                      {profileAnalysis.toneRecommended && <Tag label={`Tone: ${profileAnalysis.toneRecommended}`} />}
+                      {profileAnalysis.estimatedResponseRate && <Tag label={`Est. response: ${profileAnalysis.estimatedResponseRate}`} color="#10B981" />}
+                    </div>
+                    {profileAnalysis.redFlags && <div style={{ color: "#F59E0B", fontSize: 11, padding: "6px 10px", background: "#1E1008", borderRadius: 6, border: "1px solid #451A03" }}>⚠️ {profileAnalysis.redFlags}</div>}
+                  </div>
+                )}
+              </Section>
+
+              {/* Email if missing */}
+              {!selectedContact.email && (
+                <Section label="Professional email (optional)">
+                  <input type="email" placeholder="firstname.lastname@company.com" onChange={e => { const email = e.target.value; updateContact(selectedContact.id, { email }); }} style={inputStyle} />
+                </Section>
+              )}
+
+              {/* Notes */}
+              <Section label="Notes">
+                <textarea value={selectedContact.notes} onChange={e => { const notes = e.target.value; updateContact(selectedContact.id, { notes }); }} placeholder="Common connections, talking points, follow-up context..." style={{ ...inputStyle, height: 80, resize: "none" }} />
+              </Section>
+
+              {/* Message Generator */}
+              <Section label="Generate message">
+                <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                  {["linkedin", "email"].map(t => (
+                    <button key={t} onClick={() => setMsgType(t)} style={{ flex: 1, padding: "8px 0", fontSize: 12, fontWeight: 600, borderRadius: 8, border: `1.5px solid ${msgType === t ? "#3B82F6" : "#293548"}`, background: msgType === t ? "#1E3A5F" : "transparent", color: msgType === t ? "#60A5FA" : "#64748B", cursor: "pointer", transition: "all .15s" }}>
+                      {t === "linkedin" ? "🔗 LinkedIn" : "📧 Email"}
+                    </button>
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => generateMessage(selectedContact, msgType, false)} disabled={generatingMsg} style={{ flex: 1, padding: "10px 0", fontSize: 12, fontWeight: 600, borderRadius: 8, background: generatingMsg ? "#1E293B" : "#1D4ED8", color: generatingMsg ? "#475569" : "#fff", border: "none", cursor: generatingMsg ? "not-allowed" : "pointer", transition: "all .15s" }}>
+                    {generatingMsg ? "⏳ Generating..." : "First message"}
+                  </button>
+                  <button onClick={() => generateMessage(selectedContact, msgType, true)} disabled={generatingMsg} style={{ flex: 1, padding: "10px 0", fontSize: 12, fontWeight: 600, borderRadius: 8, background: generatingMsg ? "#1E293B" : "#92400E", color: generatingMsg ? "#475569" : "#FCD34D", border: "none", cursor: generatingMsg ? "not-allowed" : "pointer", transition: "all .15s" }}>
+                    Follow-up
+                  </button>
+                </div>
+              </Section>
+
+              {/* Generated Message */}
+              {generatedMessage && (
+                <Section label="Generated message">
+                  <div style={{ background: "#1E293B", borderRadius: 10, padding: 14, fontSize: 12, color: "#CBD5E1", lineHeight: 1.7, whiteSpace: "pre-wrap", maxHeight: 220, overflowY: "auto", border: "1px solid #293548", marginBottom: 10 }}>
+                    {generatedMessage}
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    <Btn small ghost onClick={() => navigator.clipboard?.writeText(generatedMessage)}>↗ Copy</Btn>
+                    {msgType === "email" && selectedContact.email && (
+                      <Btn small warning onClick={() => createGmailDraft(selectedContact)}>📧 Create Gmail draft</Btn>
+                    )}
+                    <Btn small success onClick={() => updateContactStage(selectedContact.id, "Message envoyé")}>✅ Mark as sent</Btn>
+                  </div>
+                  {gmailStatus && <div style={{ fontSize: 11, color: gmailStatus.startsWith("✅") ? "#10B981" : "#F59E0B", marginTop: 8, fontWeight: 500 }}>{gmailStatus}</div>}
+                </Section>
+              )}
+
+              {/* Message History */}
+              {(selectedContact.messageHistory || []).length > 0 && (
+                <Section label={`Message history (${selectedContact.messageHistory.length})`}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {selectedContact.messageHistory.map((m, i) => (
+                      <div key={i} style={{ background: "#1E293B", borderRadius: 8, padding: "8px 12px", fontSize: 11, border: "1px solid #293548" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                          <span style={{ color: "#64748B", fontWeight: 600, textTransform: "uppercase", fontSize: 9 }}>{m.type} · {m.channel}</span>
+                          <span style={{ color: "#475569" }}>{m.date}</span>
+                        </div>
+                        <div style={{ color: "#94A3B8" }}>{m.preview}...</div>
+                      </div>
+                    ))}
+                  </div>
+                </Section>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════════════ APOLLO MODAL ═══════════════════ */}
+      {showApollo && (
+        <Modal onClose={() => setShowApollo(false)} title="🟠 Apollo Search" subtitle="Find LBS alumni in target firms · Basic plan">
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            <div>
+              <Label>Apollo API Key</Label>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input type={showApiKey ? "text" : "password"} value={apolloKey} onChange={e => setApolloKey(e.target.value)} placeholder="api_key_xxxx" style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }} />
+                <button onClick={() => setShowApiKey(v => !v)} style={{ fontSize: 11, color: "#64748B", background: "none", border: "none", cursor: "pointer" }}>{showApiKey ? "Hide" : "Show"}</button>
+                {apolloKey && <span style={{ color: "#10B981", fontSize: 16 }}>✓</span>}
+              </div>
+              <div style={{ fontSize: 10, color: "#475569", marginTop: 4 }}>apollo.io → Settings → API Keys. Not stored, cleared on close.</div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <div>
+                <Label>Sector</Label>
+                <Select value={apolloSector} onChange={e => { setApolloSector(e.target.value); setApolloCompany(""); }} options={SECTORS} />
+              </div>
+              <div>
+                <Label>Target company</Label>
+                <Select value={apolloCompany} onChange={e => { setApolloCompany(e.target.value); setApolloCustomCompany(""); }} options={["", ...(TARGET_COMPANIES[apolloSector] || [])]} placeholder="Select..." />
+              </div>
+            </div>
+            <div>
+              <Label>Or custom company</Label>
+              <input value={apolloCustomCompany} onChange={e => { setApolloCustomCompany(e.target.value); setApolloCompany(""); }} placeholder="e.g. Barings, MV Credit..." style={inputStyle} />
+            </div>
+            <button onClick={searchApollo} disabled={apolloSearching || !apolloKey || (!apolloCompany && !apolloCustomCompany)} style={{ padding: "12px", background: "#EA580C", color: "#fff", border: "none", borderRadius: 10, fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: apolloSearching || !apolloKey ? 0.4 : 1 }}>
+              {apolloSearching ? "⏳ Searching..." : `🔍 Search LBS alumni at ${apolloCustomCompany || apolloCompany || "..."}`}
+            </button>
+            {apolloError && <div style={{ background: "#1C1307", border: "1px solid #713F12", borderRadius: 8, padding: "10px 12px", fontSize: 12, color: "#FCD34D" }}>{apolloError}</div>}
+            {apolloResults.length > 0 && (
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: "#94A3B8" }}>{apolloResults.length} profiles · {apolloResults.filter(r => r.selected).length} selected</span>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <button onClick={() => setApolloResults(p => p.map(r => ({ ...r, selected: true })))} style={{ fontSize: 11, color: "#3B82F6", background: "none", border: "none", cursor: "pointer" }}>Select all</button>
+                    <button onClick={() => setApolloResults(p => p.map(r => ({ ...r, selected: false })))} style={{ fontSize: 11, color: "#475569", background: "none", border: "none", cursor: "pointer" }}>Deselect</button>
+                  </div>
+                </div>
+                <div style={{ maxHeight: 240, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
+                  {apolloResults.map(r => (
+                    <div key={r.apolloId} onClick={() => setApolloResults(p => p.map(x => x.apolloId === r.apolloId ? { ...x, selected: !x.selected } : x))} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: r.selected ? "#1E3A5F" : "#1E293B", border: `1px solid ${r.selected ? "#3B82F6" : "#293548"}`, borderRadius: 8, cursor: "pointer", transition: "all .15s" }}>
+                      <div style={{ width: 18, height: 18, borderRadius: 4, border: `2px solid ${r.selected ? "#3B82F6" : "#475569"}`, background: r.selected ? "#3B82F6" : "transparent", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        {r.selected && <span style={{ color: "#fff", fontSize: 10, fontWeight: 700 }}>✓</span>}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: "#F1F5F9" }}>{r.name}</div>
+                        <div style={{ fontSize: 10, color: "#64748B" }}>{r.role} · {r.company}</div>
+                      </div>
+                      <div style={{ flexShrink: 0 }}>
+                        {r.email ? <span style={{ fontSize: 10, color: "#10B981", background: "#052E16", padding: "2px 6px", borderRadius: 4 }}>✉ Email</span> : <span style={{ fontSize: 10, color: "#475569" }}>No email</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <button onClick={importFromApollo} disabled={apolloResults.filter(r => r.selected).length === 0} style={{ marginTop: 10, width: "100%", padding: 12, background: "#1D4ED8", color: "#fff", border: "none", borderRadius: 10, fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: apolloResults.filter(r => r.selected).length === 0 ? 0.4 : 1 }}>
+                  Import {apolloResults.filter(r => r.selected).length} contacts →
+                </button>
+              </div>
+            )}
+          </div>
+        </Modal>
+      )}
+
+      {/* ═══════════════════ ADD CONTACT MODAL ═══════════════════ */}
+      {showAddContact && (
+        <Modal onClose={() => setShowAddContact(false)} title="Add contact manually">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            {[
+              { k: "name", label: "Full name *", ph: "Sarah Chen" },
+              { k: "company", label: "Company *", ph: "Arcmont Asset Management" },
+              { k: "role", label: "Role", ph: "Associate - Direct Lending" },
+              { k: "school", label: "LBS cohort", ph: "LBS MFA 2022" },
+              { k: "linkedin", label: "LinkedIn", ph: "linkedin.com/in/..." },
+              { k: "email", label: "Work email", ph: "firstname@company.com" },
+            ].map(f => (
+              <div key={f.k}>
+                <Label>{f.label}</Label>
+                <input value={newContact[f.k]} onChange={e => setNewContact(p => ({ ...p, [f.k]: e.target.value }))} placeholder={f.ph} style={inputStyle} />
+              </div>
+            ))}
+            <div>
+              <Label>Grade</Label>
+              <Select value={newContact.grade} onChange={e => setNewContact(p => ({ ...p, grade: e.target.value }))} options={GRADES} />
+            </div>
+            <div>
+              <Label>Sector</Label>
+              <Select value={newContact.sector} onChange={e => setNewContact(p => ({ ...p, sector: e.target.value }))} options={SECTORS} />
+            </div>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <Label>Notes</Label>
+              <textarea value={newContact.notes} onChange={e => setNewContact(p => ({ ...p, notes: e.target.value }))} placeholder="Common connections, talking points..." style={{ ...inputStyle, height: 60, resize: "none" }} />
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+            <Btn ghost onClick={() => setShowAddContact(false)}>Cancel</Btn>
+            <Btn primary onClick={addContact} disabled={!newContact.name || !newContact.company}>Add contact</Btn>
+          </div>
+        </Modal>
+      )}
+
+      {/* ═══════════════════ CALENDAR MODAL ═══════════════════ */}
+      {showCalendar && calendarContact && (
+        <Modal onClose={() => { setShowCalendar(false); setCalendarStatus(""); }} title="📅 Schedule call" subtitle={`${calendarContact.name} · ${calendarContact.company}`}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <div>
+                <Label>Date</Label>
+                <input type="date" value={calEvent.date} onChange={e => setCalEvent(p => ({ ...p, date: e.target.value }))} style={inputStyle} />
+              </div>
+              <div>
+                <Label>Time</Label>
+                <input type="time" value={calEvent.time} onChange={e => setCalEvent(p => ({ ...p, time: e.target.value }))} style={inputStyle} />
+              </div>
+            </div>
+            <div>
+              <Label>Platform</Label>
+              <Select value={calEvent.platform} onChange={e => setCalEvent(p => ({ ...p, platform: e.target.value }))} options={["Google Meet", "Microsoft Teams", "Zoom", "Phone call"]} />
+            </div>
+            <Btn primary onClick={createCalendarEvent} disabled={!calEvent.date}>📅 Create calendar event</Btn>
+            {calendarStatus && <div style={{ fontSize: 12, color: calendarStatus.startsWith("✅") ? "#10B981" : "#F59E0B", fontWeight: 500 }}>{calendarStatus}</div>}
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ─── MICRO COMPONENTS ─────────────────────────────────────────────────────────
+
+function Chip({ children, color = "#3B82F6", pulse }) {
+  return (
+    <div style={{ fontSize: 11, color, background: `${color}18`, border: `1px solid ${color}40`, padding: "3px 10px", borderRadius: 20, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+      {pulse && <span style={{ width: 6, height: 6, borderRadius: "50%", background: color, animation: "pulse 1.5s infinite" }} />}
+      {children}
+    </div>
+  );
+}
+
+function Btn({ children, onClick, primary, ghost, small, warning, success, disabled }) {
+  const bg = primary ? "#1D4ED8" : ghost ? "transparent" : warning ? "#92400E" : success ? "#065F46" : "transparent";
+  const color = primary ? "#fff" : ghost ? "#94A3B8" : warning ? "#FCD34D" : success ? "#34D399" : "#94A3B8";
+  const border = ghost ? "1px solid #293548" : "none";
+  return (
+    <button onClick={onClick} disabled={disabled} style={{ padding: small ? "5px 12px" : "8px 16px", fontSize: small ? 11 : 12, fontWeight: 600, background: bg, color: disabled ? "#475569" : color, border, borderRadius: 8, cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.5 : 1, transition: "all .15s", whiteSpace: "nowrap" }}>
+      {children}
+    </button>
+  );
+}
+
+function Select({ value, onChange, options, placeholder }) {
+  return (
+    <select value={value} onChange={onChange} style={{ ...inputStyle, background: "#1E293B" }}>
+      {placeholder && <option value="">{placeholder}</option>}
+      {options.map(o => <option key={o} value={o}>{o || placeholder}</option>)}
+    </select>
+  );
+}
+
+function StagePill({ stage, small }) {
+  const s = stageStyle(stage);
+  return (
+    <span style={{ fontSize: small ? 9 : 10, padding: small ? "2px 6px" : "2px 8px", borderRadius: 20, background: s.bg, color: s.color, fontWeight: 600, border: `1px solid ${s.color}30` }}>{stage}</span>
+  );
+}
+
+function GradePill({ grade }) {
+  const colors = { Analyst: "#3B82F6", Associate: "#8B5CF6", VP: "#EC4899", Director: "#F59E0B", MD: "#EF4444" };
+  const c = colors[grade] || "#64748B";
+  return <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: `${c}18`, color: c, fontWeight: 600 }}>{grade || "—"}</span>;
+}
+
+function Section({ label, children }) {
+  return (
+    <div>
+      <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 8 }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+function Label({ children }) {
+  return <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 6 }}>{children}</div>;
+}
+
+function InfoRow({ label, value }) {
+  return (
+    <div>
+      <span style={{ fontSize: 10, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}: </span>
+      <span style={{ fontSize: 11, color: "#94A3B8" }}>{value}</span>
+    </div>
+  );
+}
+
+function Tag({ label, color = "#475569" }) {
+  return <span style={{ fontSize: 10, padding: "2px 8px", background: "#1E293B", color, border: `1px solid ${color}40`, borderRadius: 20, fontWeight: 500 }}>{label}</span>;
+}
+
+function LoadingDots({ label }) {
+  return <div style={{ fontSize: 12, color: "#64748B", display: "flex", alignItems: "center", gap: 6 }}><span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⏳</span>{label}</div>;
+}
+
+function Modal({ onClose, title, subtitle, children }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 60, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={onClose}>
+      <div style={{ background: "#0F172A", borderRadius: 16, width: "100%", maxWidth: 520, maxHeight: "90vh", overflowY: "auto", border: "1px solid #1E293B", boxShadow: "0 25px 80px rgba(0,0,0,0.6)" }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: "20px 24px 16px", borderBottom: "1px solid #1E293B", display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: "#F1F5F9" }}>{title}</div>
+            {subtitle && <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>{subtitle}</div>}
+          </div>
+          <button onClick={onClose} style={{ fontSize: 20, color: "#475569", background: "none", border: "none", cursor: "pointer" }}>×</button>
+        </div>
+        <div style={{ padding: 24 }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+const inputStyle = {
+  width: "100%",
+  background: "#1E293B",
+  border: "1px solid #293548",
+  borderRadius: 8,
+  padding: "9px 12px",
+  fontSize: 12,
+  color: "#E2E8F0",
+  outline: "none",
+  boxSizing: "border-box",
+};
